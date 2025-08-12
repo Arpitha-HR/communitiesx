@@ -27,6 +27,9 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { AlertCircle, Check, ChevronsUpDown, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Loading } from '@/components/ui/loading';
+import { isOrgAdminForCommunity } from '@/lib/utils';
+import { usePermission } from '@/hooks/use-permission';
+import { PERMISSIONS } from '@/lib/permissions/permission-const';
 
 interface Tag {
     id: number;
@@ -56,15 +59,36 @@ function NewPostForm() {
         );
 
     // Check if user is a member of the community
+    const { checkCommunityPermission, isAppAdmin } = usePermission();
+
     const userMembership = community?.members?.find(
         (m) => m.userId === session?.user.id,
     );
+
+    // Check if user is a member of the community
     const isMember =
         !!userMembership && userMembership.membershipType === 'member';
 
-    // Check if user can create posts based on role hierarchy
+    // Check if user can create posts using proper permission system
     const canCreatePost = React.useMemo(() => {
-        if (!isMember || !userMembership) return false;
+        if (!community?.id) return false;
+
+        // SuperAdmin can create posts anywhere
+        if (isAppAdmin()) return true;
+
+        // Check if user has permission to create posts in this community
+        const hasPermission = checkCommunityPermission(
+            community.id.toString(),
+            PERMISSIONS.CREATE_POST,
+            community.orgId, // Pass community's orgId for org admin validation
+        );
+
+        if (hasPermission) return true;
+
+        // Fallback: check if user is a member with appropriate role
+        if (!userMembership || userMembership.membershipType !== 'member') {
+            return false;
+        }
 
         const roleHierarchy = {
             member: 1,
@@ -81,7 +105,13 @@ function NewPostForm() {
             ] || 1;
 
         return userRoleLevel >= minRoleLevel;
-    }, [isMember, userMembership, community?.postCreationMinRole]);
+    }, [
+        community?.id,
+        userMembership,
+        community?.postCreationMinRole,
+        checkCommunityPermission,
+        isAppAdmin,
+    ]);
 
     // Get available tags for the community
     const availableTags = community?.tags || [];
@@ -361,9 +391,7 @@ function NewPostForm() {
 
 export default function NewPostPage() {
     return (
-        <Suspense
-            fallback={<div className="mx-auto max-w-4xl p-4">Loading...</div>}
-        >
+        <Suspense fallback={<Loading message="Loading editor..." />}>
             <NewPostForm />
         </Suspense>
     );

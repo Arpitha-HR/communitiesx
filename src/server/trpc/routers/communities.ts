@@ -9,12 +9,93 @@ import {
     tags,
     communityAllowedOrgs,
 } from '@/server/db/schema';
-import { eq, and, desc, or, lt, inArray, sql } from 'drizzle-orm';
+import { eq, and, desc, or, lt, inArray, sql, ilike } from 'drizzle-orm';
 import { TRPCError } from '@trpc/server';
 import { ServerPermissions } from '@/server/utils/permission';
 import { PERMISSIONS } from '@/lib/permissions/permission-const';
 
 export const communitiesRouter = router({
+    // Search communities by name
+    search: publicProcedure
+        .input(
+            z.object({
+                search: z.string().min(1),
+                limit: z.number().min(1).max(100).default(20),
+                offset: z.number().default(0),
+            }),
+        )
+        .query(async ({ ctx, input }) => {
+            const { search, limit, offset } = input;
+
+            // orgId is included in the user object via selectUserFields and customSession in better-auth config
+            const orgId = (ctx.session?.user as { orgId?: string })?.orgId;
+
+            // This includes public communities and communities from their org
+            let baseFilter: any;
+
+            if (orgId) {
+                // Get all community IDs where this org is allowed
+                const allowedCommunityRows = await db
+                    .select({ communityId: communityAllowedOrgs.communityId })
+                    .from(communityAllowedOrgs)
+                    .where(eq(communityAllowedOrgs.orgId, orgId));
+                const allowedCommunityIds = allowedCommunityRows.map(
+                    (row) => row.communityId,
+                );
+
+                // Show communities that are: public OR belong to user's org OR are explicitly allowed for user's org
+                baseFilter = or(
+                    eq(communities.type, 'public'), // Public communities
+                    eq(communities.orgId, orgId), // User's org communities
+                    allowedCommunityIds.length > 0
+                        ? inArray(communities.id, allowedCommunityIds)
+                        : sql`false`, // Explicitly allowed communities
+                );
+            } else {
+                // If no orgId, only show public communities
+                baseFilter = eq(communities.type, 'public');
+            }
+
+            const searchTerm = `%${search.toLowerCase()}%`;
+            const searchFilter = ilike(communities.name, searchTerm);
+
+            // Get total count for pagination
+            const totalCountResult = await db
+                .select({ count: sql<number>`count(*)` })
+                .from(communities)
+                .where(and(baseFilter, searchFilter));
+
+            const totalCount = totalCountResult[0]?.count || 0;
+
+            // Fetch paginated results
+            const searchResults = await db.query.communities.findMany({
+                where: and(baseFilter, searchFilter),
+                with: {
+                    members: true,
+                    posts: true,
+                    creator: {
+                        columns: {
+                            id: true,
+                            name: true,
+                            email: true,
+                        },
+                    },
+                },
+                orderBy: desc(communities.id),
+                limit: limit,
+                offset: offset,
+            });
+
+            // Check if there are more results
+            const hasNextPage = offset + limit < totalCount;
+
+            return {
+                items: searchResults,
+                totalCount,
+                hasNextPage,
+            };
+        }),
+
     getAll: publicProcedure
         .input(
             z
@@ -267,14 +348,23 @@ export const communitiesRouter = router({
                 // If the community is private, check if the user has access
                 if (community.type === 'private' && ctx.session?.user) {
                     const userId = ctx.session.user.id;
+                    const userOrgId = (ctx.session.user as any).orgId;
+                    const userRole = (ctx.session.user as any).role;
 
                     // Check if user is a member or follower
                     const membership = community.members.find(
                         (m) => m.userId === userId && m.status === 'active',
                     );
 
-                    // If user is not a member or follower, return the community without posts
-                    if (!membership) {
+                    // --- ORG ADMIN OVERRIDE ---
+                    const isOrgAdminForCommunity =
+                        userRole === 'admin' &&
+                        userOrgId &&
+                        community.orgId &&
+                        userOrgId === community.orgId;
+
+                    // If user is not a member/follower and not org admin, hide posts
+                    if (!membership && !isOrgAdminForCommunity) {
                         return {
                             ...community,
                             posts: [],
@@ -288,7 +378,7 @@ export const communitiesRouter = router({
                     };
                 }
 
-                // Load posts with authors and tags
+                // Load posts with authors, tags, and comments
                 const postsWithAuthors = await db.query.posts.findMany({
                     where: and(
                         eq(posts.communityId, community.id),
@@ -301,19 +391,22 @@ export const communitiesRouter = router({
                                 tag: true,
                             },
                         },
+                        comments: true, // <-- include comments
                     },
                     orderBy: desc(posts.createdAt),
                 });
 
-                // Transform posts to include tags array
+                // Transform posts to include tags array and comments array
                 const postsWithTags = postsWithAuthors.map((post) => ({
                     ...post,
                     tags: post.postTags.map((pt) => pt.tag),
+                    comments: post.comments?.filter((c) => !c.isDeleted) || [],
                 }));
 
                 // Return the community with posts that include author information and tags
                 return {
                     ...community,
+                    orgId: community.orgId, // <-- add this line
                     posts: postsWithTags,
                 };
             } catch (error) {
@@ -736,10 +829,11 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canManageMembers = permission.checkCommunityPermission(
-                    input.communityId.toString(),
-                    PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
-                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
 
                 if (!canManageMembers) {
                     throw new TRPCError({
@@ -805,10 +899,11 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canManageMembers = permission.checkCommunityPermission(
-                    request.communityId.toString(),
-                    PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
-                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        request.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
 
                 if (!canManageMembers) {
                     throw new TRPCError({
@@ -920,10 +1015,11 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canManageMembers = permission.checkCommunityPermission(
-                    request.communityId.toString(),
-                    PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
-                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        request.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
 
                 if (!canManageMembers) {
                     throw new TRPCError({
@@ -976,10 +1072,11 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canManageMembers = permission.checkCommunityPermission(
-                    input.communityId.toString(),
-                    PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
-                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
 
                 if (!canManageMembers) {
                     throw new TRPCError({
@@ -1063,10 +1160,11 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canManageMembers = permission.checkCommunityPermission(
-                    input.communityId.toString(),
-                    PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
-                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
 
                 if (!canManageMembers) {
                     throw new TRPCError({
@@ -1206,10 +1304,11 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canManageMembers = permission.checkCommunityPermission(
-                    input.communityId.toString(),
-                    PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
-                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
 
                 if (!canManageMembers) {
                     throw new TRPCError({
@@ -1286,7 +1385,7 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canCreateTag = permission.checkCommunityPermission(
+                const canCreateTag = await permission.checkCommunityPermission(
                     input.communityId.toString(),
                     PERMISSIONS.CREATE_TAG,
                 );
@@ -1345,7 +1444,7 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canEditTag = permission.checkCommunityPermission(
+                const canEditTag = await permission.checkCommunityPermission(
                     tag.communityId.toString(),
                     PERMISSIONS.EDIT_TAG,
                 );
@@ -1398,7 +1497,7 @@ export const communitiesRouter = router({
                 const permission = await ServerPermissions.fromUserId(
                     ctx.session.user.id,
                 );
-                const canDeleteTag = permission.checkCommunityPermission(
+                const canDeleteTag = await permission.checkCommunityPermission(
                     tag.communityId.toString(),
                     PERMISSIONS.EDIT_TAG,
                 );

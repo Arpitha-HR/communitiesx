@@ -69,9 +69,12 @@ import {
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Badge } from '@/components/ui/badge';
+import { UserBadgeDisplay } from '@/components/ui/user-badge-display';
+import { UserBadgesInTable } from '@/components/ui/user-badges-in-table';
 import { usePermission } from '@/hooks/use-permission';
 import { PERMISSIONS } from '@/lib/permissions/permission-const';
 import { SafeHtml } from '@/lib/sanitize';
+import { isOrgAdminForCommunity } from '@/lib/utils';
 
 // Function to calculate relative time
 function getRelativeTime(date: Date): string {
@@ -150,9 +153,18 @@ export default function CommunityDetailPage() {
 
     const { checkCommunityPermission } = usePermission();
 
+    // Check if user is org admin for this community
+    const isOrgAdminForCommunityCheck = isOrgAdminForCommunity(
+        session?.user,
+        community?.orgId,
+    );
+
     // Check if user can create posts based on role hierarchy
     const canCreatePost = useMemo(() => {
         if (!session?.user?.id || !community) return false;
+
+        // If org admin, allow post creation
+        if (isOrgAdminForCommunityCheck) return true;
 
         const userMembership = community.members?.find(
             (m) =>
@@ -179,35 +191,59 @@ export default function CommunityDetailPage() {
 
         return userRoleLevel >= minRoleLevel;
     }, [session?.user?.id, community]);
-    const canEditPost = checkCommunityPermission(
-        community?.id?.toString() ?? '',
-        PERMISSIONS.EDIT_POST,
-    );
-    const canDeletePost = checkCommunityPermission(
-        community?.id?.toString() ?? '',
-        PERMISSIONS.DELETE_POST,
-    );
+    const canEditPost = (post: any) => {
+        if (!session) return false;
+
+        // Check if user is the post author
+        if (post.author && post.author.id === session.user.id) return true;
+
+        // Check community permissions
+        return checkCommunityPermission(
+            community?.id?.toString() ?? '',
+            PERMISSIONS.EDIT_POST,
+            community?.orgId, // Pass community's orgId for org admin validation
+        );
+    };
+
+    const canDeletePost = (post: any) => {
+        if (!session) return false;
+
+        // Check if user is the post author
+        if (post.author && post.author.id === session.user.id) return true;
+
+        // Check community permissions
+        return checkCommunityPermission(
+            community?.id?.toString() ?? '',
+            PERMISSIONS.DELETE_POST,
+            community?.orgId, // Pass community's orgId for org admin validation
+        );
+    };
 
     const canCreateTag = checkCommunityPermission(
         community?.id?.toString() ?? '',
         PERMISSIONS.CREATE_TAG,
+        community?.orgId,
     );
     const canEditTag = checkCommunityPermission(
         community?.id?.toString() ?? '',
         PERMISSIONS.EDIT_TAG,
+        community?.orgId,
     );
     const canDeleteTag = checkCommunityPermission(
         community?.id?.toString() ?? '',
         PERMISSIONS.DELETE_TAG,
+        community?.orgId,
     );
 
     const canManageCommunityMembers = checkCommunityPermission(
         community?.id?.toString() ?? '',
         PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+        community?.orgId,
     );
     const canInviteCommunityMembers = checkCommunityPermission(
         community?.id?.toString() ?? '',
         PERMISSIONS.INVITE_COMMUNITY_MEMBERS,
+        community?.orgId,
     );
 
     const handleEditTag = (tag: any) => {
@@ -238,11 +274,15 @@ export default function CommunityDetailPage() {
                 enabled:
                     !!session &&
                     !!community?.id &&
-                    !!community?.members?.some(
+                    (!!community?.members?.some(
                         (m) =>
                             m.userId === session?.user.id &&
                             (m.role === 'admin' || m.role === 'moderator'),
-                    ),
+                    ) ||
+                        // Allow org admins to see pending requests
+                        isOrgAdminForCommunityCheck ||
+                        // Allow Super Admins to see pending requests for any community
+                        (session?.user as any)?.appRole === 'admin'),
             },
         );
 
@@ -602,7 +642,8 @@ export default function CommunityDetailPage() {
         (m) => m.userId === session.user.id,
     );
     const isMember =
-        !!userMembership && userMembership.membershipType === 'member';
+        (!!userMembership && userMembership.membershipType === 'member') ||
+        isOrgAdminForCommunityCheck;
     const isFollower =
         !!userMembership && userMembership.membershipType === 'follower';
     const isModerator = !!userMembership && userMembership.role === 'moderator';
@@ -1361,7 +1402,9 @@ export default function CommunityDetailPage() {
 
                                                                 {/* Action buttons */}
                                                                 <div className="flex space-x-1">
-                                                                    {canEditPost && (
+                                                                    {canEditPost(
+                                                                        post,
+                                                                    ) && (
                                                                         <button
                                                                             type="button"
                                                                             onClick={(
@@ -1378,7 +1421,9 @@ export default function CommunityDetailPage() {
                                                                             <Edit className="h-4 w-4" />
                                                                         </button>
                                                                     )}
-                                                                    {canDeletePost && (
+                                                                    {canDeletePost(
+                                                                        post,
+                                                                    ) && (
                                                                         <button
                                                                             type="button"
                                                                             onClick={(
@@ -1604,12 +1649,19 @@ export default function CommunityDetailPage() {
                                         <Table>
                                             <TableHeader>
                                                 <TableRow>
-                                                    <TableHead>User</TableHead>
-                                                    <TableHead>Role</TableHead>
-                                                    <TableHead>
+                                                    <TableHead className="text-center">
+                                                        User
+                                                    </TableHead>
+                                                    <TableHead className="text-center">
+                                                        Badges
+                                                    </TableHead>
+                                                    <TableHead className="text-center">
+                                                        Role
+                                                    </TableHead>
+                                                    <TableHead className="text-center">
                                                         Joined
                                                     </TableHead>
-                                                    <TableHead className="text-right">
+                                                    <TableHead className="text-center">
                                                         Actions
                                                     </TableHead>
                                                 </TableRow>
@@ -1644,8 +1696,8 @@ export default function CommunityDetailPage() {
                                                         <TableRow
                                                             key={member.userId}
                                                         >
-                                                            <TableCell>
-                                                                <div className="flex items-center gap-3">
+                                                            <TableCell className="text-center">
+                                                                <div className="flex items-center justify-center gap-3">
                                                                     {member.user
                                                                         ?.id ? (
                                                                         <UserProfilePopover
@@ -1732,7 +1784,19 @@ export default function CommunityDetailPage() {
                                                                     </div>
                                                                 </div>
                                                             </TableCell>
-                                                            <TableCell>
+                                                            <TableCell className="text-center">
+                                                                {member.user
+                                                                    ?.id && (
+                                                                    <UserBadgesInTable
+                                                                        userId={
+                                                                            member
+                                                                                .user
+                                                                                .id
+                                                                        }
+                                                                    />
+                                                                )}
+                                                            </TableCell>
+                                                            <TableCell className="text-center">
                                                                 <Badge
                                                                     variant={
                                                                         member.role ===
@@ -1753,14 +1817,14 @@ export default function CommunityDetailPage() {
                                                                           : 'Member'}
                                                                 </Badge>
                                                             </TableCell>
-                                                            <TableCell>
+                                                            <TableCell className="text-center">
                                                                 {member.joinedAt
                                                                     ? new Date(
                                                                           member.joinedAt,
                                                                       ).toLocaleDateString()
                                                                     : '-'}
                                                             </TableCell>
-                                                            <TableCell className="text-right">
+                                                            <TableCell className="text-center">
                                                                 {canManageCommunityMembers && (
                                                                     <DropdownMenu>
                                                                         <DropdownMenuTrigger

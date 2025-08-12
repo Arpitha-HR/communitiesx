@@ -25,6 +25,8 @@ import { ArrowLeft, Globe, Lock, ImageIcon } from 'lucide-react';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Loading } from '@/components/ui/loading';
+import { usePermission } from '@/hooks/use-permission';
+import { PERMISSIONS } from '@/lib/permissions/permission-const';
 import {
     Select,
     SelectContent,
@@ -186,6 +188,31 @@ export default function EditCommunityPage() {
                         <ArrowLeft className="mr-2 h-4 w-4" />
                         Back to Communities
                     </Link>
+                </Button>
+            </div>
+        );
+    }
+
+    const { checkCommunityPermission, isAppAdmin } = usePermission();
+
+    // Check if user has permission to edit this community
+    const canEditCommunity =
+        isAppAdmin() ||
+        (community?.id &&
+            checkCommunityPermission(
+                community.id.toString(),
+                PERMISSIONS.EDIT_COMMUNITY,
+            ));
+
+    if (!canEditCommunity) {
+        return (
+            <div className="container mx-auto px-4 py-16 text-center">
+                <h1 className="mb-4 text-3xl font-bold">Access Denied</h1>
+                <p className="text-muted-foreground mb-8">
+                    You do not have permission to edit this community.
+                </p>
+                <Button asChild>
+                    <Link href={`/communities/${slug}`}>Back to Community</Link>
                 </Button>
             </div>
         );
