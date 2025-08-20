@@ -11,6 +11,7 @@ export const permissions = {
             'delete_org',
             'manage_org_members',
             'invite_org_members',
+            'create_org_users', // New permission for creating users
 
             'view_community',
             'edit_community',
@@ -18,6 +19,8 @@ export const permissions = {
             'create_community',
             'manage_community_members',
             'invite_community_members',
+            'remove_community_creator',
+            'assign_community_admin',
 
             'create_post',
             'edit_post',
@@ -52,6 +55,8 @@ export const permissions = {
             'delete_community',
             'manage_community_members',
             'invite_community_members',
+            'remove_community_creator',
+            'assign_community_admin',
 
             'create_post',
             'edit_post',

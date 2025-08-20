@@ -8,11 +8,52 @@ import {
     communityMemberRequests,
     tags,
     communityAllowedOrgs,
+    notificationPreferences,
+    orgMembers,
+    users,
 } from '@/server/db/schema';
 import { eq, and, desc, or, lt, inArray, sql, ilike } from 'drizzle-orm';
 import { TRPCError } from '@trpc/server';
 import { ServerPermissions } from '@/server/utils/permission';
 import { PERMISSIONS } from '@/lib/permissions/permission-const';
+
+// Helper function to check if user has access to modify notification preferences for a community
+async function hasNotificationPreferenceAccess(
+    userId: string,
+    communityId: number,
+): Promise<boolean> {
+    // Check if user is a member of the community
+    const membership = await db.query.communityMembers.findFirst({
+        where: and(
+            eq(communityMembers.userId, userId),
+            eq(communityMembers.communityId, communityId),
+            eq(communityMembers.status, 'active'),
+        ),
+    });
+
+    if (membership) {
+        return true;
+    }
+
+    // Check if user is org admin for this community
+    const community = await db.query.communities.findFirst({
+        where: eq(communities.id, communityId),
+    });
+
+    if (community?.orgId) {
+        const orgAdminCheck = await db.query.orgMembers.findFirst({
+            where: and(
+                eq(orgMembers.userId, userId),
+                eq(orgMembers.orgId, community.orgId),
+                eq(orgMembers.role, 'admin'),
+                eq(orgMembers.status, 'active'),
+            ),
+        });
+        return !!orgAdminCheck;
+    }
+
+    return false;
+}
 
 export const communitiesRouter = router({
     // Search communities by name
@@ -72,7 +113,9 @@ export const communitiesRouter = router({
                 where: and(baseFilter, searchFilter),
                 with: {
                     members: true,
-                    posts: true,
+                    posts: {
+                        where: eq(posts.isDeleted, false),
+                    },
                     creator: {
                         columns: {
                             id: true,
@@ -140,7 +183,9 @@ export const communitiesRouter = router({
                     where: and(filter, lt(communities.id, cursor)),
                     with: {
                         members: true,
-                        posts: true,
+                        posts: {
+                            where: eq(posts.isDeleted, false),
+                        },
                         creator: {
                             columns: {
                                 id: true,
@@ -167,8 +212,10 @@ export const communitiesRouter = router({
                 const allCommunities = await query.findMany({
                     where: filter,
                     with: {
+                        posts: {
+                            where: eq(posts.isDeleted, false),
+                        },
                         members: true,
-                        posts: true,
                         creator: {
                             columns: {
                                 id: true,
@@ -1147,6 +1194,86 @@ export const communitiesRouter = router({
             }
         }),
 
+    // Assign admin role to a community member (super admin, org admin, or community admin only)
+    assignAdmin: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+                userId: z.string(),
+            }),
+        )
+        .mutation(async ({ input, ctx }) => {
+            try {
+                const permission = await ServerPermissions.fromUserId(
+                    ctx.session.user.id,
+                );
+                const canAssignAdmin =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.ASSIGN_COMMUNITY_ADMIN,
+                    );
+
+                if (!canAssignAdmin) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message: 'You dont have access to assign admin role',
+                    });
+                }
+
+                // Check if the target user is a member of the community
+                const targetMembership =
+                    await db.query.communityMembers.findFirst({
+                        where: and(
+                            eq(communityMembers.userId, input.userId),
+                            eq(communityMembers.communityId, input.communityId),
+                            eq(communityMembers.membershipType, 'member'),
+                        ),
+                    });
+
+                if (!targetMembership) {
+                    throw new TRPCError({
+                        code: 'BAD_REQUEST',
+                        message:
+                            'The user must be a member of the community to be assigned as admin',
+                    });
+                }
+
+                // Check if the user is already an admin
+                if (targetMembership.role === 'admin') {
+                    throw new TRPCError({
+                        code: 'BAD_REQUEST',
+                        message: 'This user is already a community admin',
+                    });
+                }
+
+                // Update the user's role to admin
+                const [updatedMembership] = await db
+                    .update(communityMembers)
+                    .set({
+                        role: 'admin',
+                        updatedAt: new Date(),
+                    })
+                    .where(
+                        and(
+                            eq(communityMembers.userId, input.userId),
+                            eq(communityMembers.communityId, input.communityId),
+                        ),
+                    )
+                    .returning();
+
+                return updatedMembership;
+            } catch (error) {
+                console.error('Error assigning admin:', error);
+                if (error instanceof TRPCError) {
+                    throw error;
+                }
+                throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'Failed to assign admin role',
+                });
+            }
+        }),
+
     // Remove moderator role from a community member (admin only)
     removeModerator: authProcedure
         .input(
@@ -1215,6 +1342,91 @@ export const communitiesRouter = router({
                 throw new TRPCError({
                     code: 'INTERNAL_SERVER_ERROR',
                     message: 'Failed to remove moderator role',
+                });
+            }
+        }),
+
+    // Remove admin role from a community member (super admin, org admin, or community admin only)
+    removeAdmin: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+                userId: z.string(),
+            }),
+        )
+        .mutation(async ({ input, ctx }) => {
+            try {
+                const permission = await ServerPermissions.fromUserId(
+                    ctx.session.user.id,
+                );
+                const canAssignAdmin =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.ASSIGN_COMMUNITY_ADMIN,
+                    );
+
+                if (!canAssignAdmin) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message: 'You dont have access to remove admin role',
+                    });
+                }
+
+                // Check if the target user is an admin of the community
+                const targetMembership =
+                    await db.query.communityMembers.findFirst({
+                        where: and(
+                            eq(communityMembers.userId, input.userId),
+                            eq(communityMembers.communityId, input.communityId),
+                            eq(communityMembers.role, 'admin'),
+                        ),
+                    });
+
+                if (!targetMembership) {
+                    throw new TRPCError({
+                        code: 'BAD_REQUEST',
+                        message: 'This user is not an admin of the community',
+                    });
+                }
+
+                // Don't allow removing the community creator's admin role
+                const community = await db.query.communities.findFirst({
+                    where: eq(communities.id, input.communityId),
+                    columns: { createdBy: true },
+                });
+
+                if (community?.createdBy === input.userId) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message:
+                            'Cannot remove admin role from the community creator',
+                    });
+                }
+
+                // Update the user's role to member
+                const [updatedMembership] = await db
+                    .update(communityMembers)
+                    .set({
+                        role: 'member',
+                        updatedAt: new Date(),
+                    })
+                    .where(
+                        and(
+                            eq(communityMembers.userId, input.userId),
+                            eq(communityMembers.communityId, input.communityId),
+                        ),
+                    )
+                    .returning();
+
+                return updatedMembership;
+            } catch (error) {
+                console.error('Error removing admin:', error);
+                if (error instanceof TRPCError) {
+                    throw error;
+                }
+                throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'Failed to remove admin role',
                 });
             }
         }),
@@ -1330,12 +1542,24 @@ export const communitiesRouter = router({
                     });
                 }
 
-                // Don't allow removing the community creator (who should be an admin)
-                if (community.createdBy === input.userId) {
-                    throw new TRPCError({
-                        code: 'FORBIDDEN',
-                        message: 'Cannot remove the community creator',
-                    });
+                // Check if user is trying to remove the community creator
+                const isRemovingCreator = community.createdBy === input.userId;
+
+                if (isRemovingCreator) {
+                    // Check if user has permission to remove community creator
+                    const canRemoveCreator =
+                        await permission.checkCommunityPermission(
+                            input.communityId.toString(),
+                            PERMISSIONS.REMOVE_COMMUNITY_CREATOR,
+                        );
+
+                    if (!canRemoveCreator) {
+                        throw new TRPCError({
+                            code: 'FORBIDDEN',
+                            message:
+                                'Cannot remove the community creator. Only super admins, organization admins, or community admins can perform this action.',
+                        });
+                    }
                 }
 
                 // Remove the user from the community
@@ -1519,6 +1743,367 @@ export const communitiesRouter = router({
                 throw new TRPCError({
                     code: 'INTERNAL_SERVER_ERROR',
                     message: 'Failed to delete tag',
+                });
+            }
+        }),
+
+    // Disable notifications for a specific community (opt-out)
+    disableCommunityNotifications: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+            }),
+        )
+        .mutation(async ({ input, ctx }) => {
+            try {
+                // Check if user has access to modify notification preferences for this community
+                const hasAccess = await hasNotificationPreferenceAccess(
+                    ctx.session.user.id,
+                    input.communityId,
+                );
+
+                if (!hasAccess) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message: 'You do not have access to this community',
+                    });
+                }
+
+                // Set notification preference to disabled (false)
+                await db
+                    .insert(notificationPreferences)
+                    .values({
+                        userId: ctx.session.user.id,
+                        communityId: input.communityId,
+                        enabled: false, // false = notifications disabled
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
+                    })
+                    .onConflictDoUpdate({
+                        target: [
+                            notificationPreferences.userId,
+                            notificationPreferences.communityId,
+                        ],
+                        set: {
+                            enabled: false,
+                            updatedAt: new Date(),
+                        },
+                    });
+
+                return { success: true };
+            } catch (error) {
+                console.error(
+                    'Error disabling community notifications:',
+                    error,
+                );
+                throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'Failed to disable notifications',
+                });
+            }
+        }),
+
+    // Re-enable notifications for a specific community
+    enableCommunityNotifications: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+            }),
+        )
+        .mutation(async ({ input, ctx }) => {
+            try {
+                // Check if user has access to modify notification preferences for this community
+                const hasAccess = await hasNotificationPreferenceAccess(
+                    ctx.session.user.id,
+                    input.communityId,
+                );
+
+                if (!hasAccess) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message: 'You do not have access to this community',
+                    });
+                }
+
+                // Set notification preference to enabled (true)
+                await db
+                    .insert(notificationPreferences)
+                    .values({
+                        userId: ctx.session.user.id,
+                        communityId: input.communityId,
+                        enabled: true, // true = notifications enabled
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
+                    })
+                    .onConflictDoUpdate({
+                        target: [
+                            notificationPreferences.userId,
+                            notificationPreferences.communityId,
+                        ],
+                        set: {
+                            enabled: true,
+                            updatedAt: new Date(),
+                        },
+                    });
+
+                return { success: true };
+            } catch (error) {
+                console.error('Error enabling community notifications:', error);
+                throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'Failed to enable notifications',
+                });
+            }
+        }),
+
+    // Check if notifications are disabled for a specific community
+    getCommunityNotificationStatus: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+            }),
+        )
+        .query(async ({ input, ctx }) => {
+            try {
+                const preference =
+                    await db.query.notificationPreferences.findFirst({
+                        where: and(
+                            eq(
+                                notificationPreferences.userId,
+                                ctx.session.user.id,
+                            ),
+                            eq(
+                                notificationPreferences.communityId,
+                                input.communityId,
+                            ),
+                        ),
+                    });
+
+                // If no preference exists, notifications are enabled by default
+                // If preference exists and enabled is false, notifications are disabled
+                return {
+                    notificationsDisabled: preference
+                        ? !preference.enabled
+                        : false,
+                };
+            } catch (error) {
+                console.error('Error checking notification status:', error);
+                return { notificationsDisabled: false };
+            }
+        }),
+
+    // Get organization members who are not yet in the community
+    getOrgMembersNotInCommunity: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+                search: z.string().optional(),
+            }),
+        )
+        .query(async ({ input, ctx }) => {
+            try {
+                // Get the community to find its organization
+                const community = await db.query.communities.findFirst({
+                    where: eq(communities.id, input.communityId),
+                    columns: { orgId: true },
+                });
+
+                if (!community?.orgId) {
+                    throw new TRPCError({
+                        code: 'NOT_FOUND',
+                        message: 'Community not found or has no organization',
+                    });
+                }
+
+                // Check if user has permission to manage community members
+                const permission = await ServerPermissions.fromUserId(
+                    ctx.session.user.id,
+                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
+
+                if (!canManageMembers) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message:
+                            'You do not have permission to manage community members',
+                    });
+                }
+
+                // Build search conditions
+                let whereConditions = and(
+                    eq(users.orgId, community.orgId),
+                    eq(users.emailVerified, true), // Only verified users
+                );
+
+                if (input.search && input.search.trim()) {
+                    const searchTerm = `%${input.search.trim()}%`;
+                    whereConditions = and(
+                        eq(users.orgId, community.orgId),
+                        eq(users.emailVerified, true),
+                        or(
+                            ilike(users.name, searchTerm),
+                            ilike(users.email, searchTerm),
+                        ),
+                    );
+                }
+
+                // Get all organization members from users table with optional search filtering
+                const orgMembersList = await db.query.users.findMany({
+                    where: whereConditions,
+                    columns: {
+                        id: true,
+                        name: true,
+                        email: true,
+                        image: true,
+                    },
+                });
+
+                // Get existing community members
+                const existingCommunityMembers =
+                    await db.query.communityMembers.findMany({
+                        where: eq(
+                            communityMembers.communityId,
+                            input.communityId,
+                        ),
+                        columns: { userId: true },
+                    });
+
+                const existingMemberIds = new Set(
+                    existingCommunityMembers.map((m) => m.userId),
+                );
+
+                // Filter out users who are already in the community
+                const availableMembers = orgMembersList.filter(
+                    (member: (typeof orgMembersList)[number]) =>
+                        !existingMemberIds.has(member.id),
+                );
+
+                return availableMembers;
+            } catch (error) {
+                if (error instanceof TRPCError) throw error;
+                console.error(
+                    'Error getting org members not in community:',
+                    error,
+                );
+                throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'Failed to get organization members',
+                });
+            }
+        }),
+
+    // Add organization members to community (supports multiple users)
+    addOrgMembersToCommunity: authProcedure
+        .input(
+            z.object({
+                communityId: z.number(),
+                users: z.array(
+                    z.object({
+                        userId: z.string(),
+                        role: z.enum(['member', 'moderator']).default('member'),
+                    }),
+                ),
+            }),
+        )
+        .mutation(async ({ input, ctx }) => {
+            try {
+                // Get the community to find its organization
+                const community = await db.query.communities.findFirst({
+                    where: eq(communities.id, input.communityId),
+                    columns: { orgId: true },
+                });
+
+                if (!community?.orgId) {
+                    throw new TRPCError({
+                        code: 'NOT_FOUND',
+                        message: 'Community not found or has no organization',
+                    });
+                }
+
+                // Check if user has permission to manage community members
+                const permission = await ServerPermissions.fromUserId(
+                    ctx.session.user.id,
+                );
+                const canManageMembers =
+                    await permission.checkCommunityPermission(
+                        input.communityId.toString(),
+                        PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
+                    );
+
+                if (!canManageMembers) {
+                    throw new TRPCError({
+                        code: 'FORBIDDEN',
+                        message:
+                            'You do not have permission to manage community members',
+                    });
+                }
+
+                // Verify all users are members of the organization
+                const userIds = input.users.map((u) => u.userId);
+                const orgMembers = await db.query.users.findMany({
+                    where: and(
+                        inArray(users.id, userIds),
+                        eq(users.orgId, community.orgId),
+                        eq(users.emailVerified, true),
+                    ),
+                    columns: { id: true },
+                });
+
+                if (orgMembers.length !== userIds.length) {
+                    throw new TRPCError({
+                        code: 'BAD_REQUEST',
+                        message:
+                            'Some users are not members of this organization',
+                    });
+                }
+
+                // Check if any users are already in the community
+                const existingMemberships =
+                    await db.query.communityMembers.findMany({
+                        where: and(
+                            eq(communityMembers.communityId, input.communityId),
+                            inArray(communityMembers.userId, userIds),
+                        ),
+                    });
+
+                if (existingMemberships.length > 0) {
+                    const existingUserIds = existingMemberships.map(
+                        (m) => m.userId,
+                    );
+                    throw new TRPCError({
+                        code: 'CONFLICT',
+                        message: `Users ${existingUserIds.join(', ')} are already members of this community`,
+                    });
+                }
+
+                // Add all users to community
+                const now = new Date();
+                const membersToAdd = input.users.map((user) => ({
+                    userId: user.userId,
+                    communityId: input.communityId,
+                    role: user.role,
+                    membershipType: 'member' as const,
+                    status: 'active' as const,
+                    joinedAt: now,
+                    updatedAt: now,
+                }));
+
+                await db.insert(communityMembers).values(membersToAdd);
+
+                return {
+                    success: true,
+                    message: `Successfully added ${input.users.length} member(s) to the community`,
+                };
+            } catch (error) {
+                if (error instanceof TRPCError) throw error;
+                console.error('Error adding org members to community:', error);
+                throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message: 'Failed to add users to community',
                 });
             }
         }),

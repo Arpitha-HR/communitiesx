@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { trpc } from '@/providers/trpc-provider';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import {
     Card,
     CardContent,
@@ -32,6 +33,10 @@ import {
     Tag,
     Building,
     X,
+    Crown,
+    UserPlus,
+    Search,
+    Loader2,
 } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Loading } from '@/components/ui/loading';
@@ -75,6 +80,24 @@ import { usePermission } from '@/hooks/use-permission';
 import { PERMISSIONS } from '@/lib/permissions/permission-const';
 import { SafeHtml } from '@/lib/sanitize';
 import { isOrgAdminForCommunity } from '@/lib/utils';
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+    DialogTrigger,
+} from '@/components/ui/dialog';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Label } from '@/components/ui/label';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 
 // Function to calculate relative time
 function getRelativeTime(date: Date): string {
@@ -144,6 +167,15 @@ export default function CommunityDetailPage() {
     const [editTagDialogOpen, setEditTagDialogOpen] = useState(false);
     const [deleteTagDialogOpen, setDeleteTagDialogOpen] = useState(false);
     const [selectedTag, setSelectedTag] = useState<any>(null);
+
+    // Add Members dialog state
+    const [isAddMembersDialogOpen, setIsAddMembersDialogOpen] = useState(false);
+    const [selectedUsersToAdd, setSelectedUsersToAdd] = useState<string[]>([]);
+    const [selectedRoleToAdd, setSelectedRoleToAdd] = useState<
+        'member' | 'moderator'
+    >('member');
+    const [isAddingMembers, setIsAddingMembers] = useState(false);
+    const [memberSearchTerm, setMemberSearchTerm] = useState('');
 
     // Tag filtering state
     const [selectedTagFilters, setSelectedTagFilters] = useState<number[]>([]);
@@ -240,6 +272,11 @@ export default function CommunityDetailPage() {
         PERMISSIONS.MANAGE_COMMUNITY_MEMBERS,
         community?.orgId,
     );
+    const canManageCommunityAdmins = checkCommunityPermission(
+        community?.id?.toString() ?? '',
+        PERMISSIONS.ASSIGN_COMMUNITY_ADMIN,
+        community?.orgId,
+    );
     const canInviteCommunityMembers = checkCommunityPermission(
         community?.id?.toString() ?? '',
         PERMISSIONS.INVITE_COMMUNITY_MEMBERS,
@@ -285,6 +322,41 @@ export default function CommunityDetailPage() {
                         (session?.user as any)?.appRole === 'admin'),
             },
         );
+
+    // Get organization members not in community
+    const { data: availableOrgMembers, refetch: refetchAvailableMembers } =
+        trpc.communities.getOrgMembersNotInCommunity.useQuery(
+            {
+                communityId: community?.id || 0,
+                search: memberSearchTerm || undefined,
+            },
+            {
+                enabled:
+                    !!session && !!community?.id && canManageCommunityMembers,
+            },
+        );
+
+    // Add member to community mutation
+    const addMemberMutation =
+        trpc.communities.addOrgMembersToCommunity.useMutation({
+            onSuccess: () => {
+                refetch();
+                refetchAvailableMembers();
+                setIsAddMembersDialogOpen(false);
+                setSelectedUsersToAdd([]);
+                setSelectedRoleToAdd('member');
+                setMemberSearchTerm('');
+                toast.success('Members added to community successfully');
+            },
+            onError: (error: any) => {
+                toast.error('Failed to add members to community', {
+                    description: error.message,
+                });
+            },
+            onSettled: () => {
+                setIsAddingMembers(false);
+            },
+        });
 
     // Check if user has pending requests
     const { data: userPendingRequests } =
@@ -408,6 +480,29 @@ export default function CommunityDetailPage() {
             },
         });
 
+    const assignAdminMutation = trpc.communities.assignAdmin.useMutation({
+        onSuccess: () => {
+            refetch();
+            toast.success('Admin role assigned successfully');
+        },
+        onError: (error) => {
+            toast.error(error.message || 'Failed to assign admin role');
+        },
+        onSettled: () => {
+            setIsActionInProgress(false);
+        },
+    });
+
+    const removeAdminMutation = trpc.communities.removeAdmin.useMutation({
+        onSuccess: () => {
+            refetch();
+            toast.success('Admin role removed successfully');
+        },
+        onError: (error) => {
+            toast.error(error.message || 'Failed to remove admin role');
+        },
+    });
+
     const removeModeratorMutation =
         trpc.communities.removeModerator.useMutation({
             onSuccess: () => {
@@ -482,6 +577,22 @@ export default function CommunityDetailPage() {
         });
     };
 
+    const handleAssignAdmin = (userId: string) => {
+        if (!community) return;
+        assignAdminMutation.mutate({
+            communityId: community.id,
+            userId,
+        });
+    };
+
+    const handleRemoveAdmin = (userId: string) => {
+        if (!community) return;
+        removeAdminMutation.mutate({
+            communityId: community.id,
+            userId,
+        });
+    };
+
     const handleRemoveModerator = (userId: string) => {
         if (!community) return;
         setModeratorToRemove(userId);
@@ -513,6 +624,25 @@ export default function CommunityDetailPage() {
         });
         setIsRemoveUserDialogOpen(false);
         setUserToRemove(null);
+    };
+
+    // Handle adding member to community
+    const handleAddMember = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!community || !selectedUsersToAdd.length) return;
+
+        setIsAddingMembers(true);
+        try {
+            await addMemberMutation.mutateAsync({
+                communityId: community.id,
+                users: selectedUsersToAdd.map((userId) => ({
+                    userId,
+                    role: selectedRoleToAdd,
+                })),
+            });
+        } catch (error) {
+            // Error is already handled in the mutation
+        }
     };
 
     // Handle tab change and reset pagination
@@ -668,7 +798,7 @@ export default function CommunityDetailPage() {
                 </div>
 
                 {/* Overlapping Content Container */}
-                <div className="relative -mt-8 px-4 sm:-mt-10 sm:px-6 md:-mt-12 md:px-8 lg:-mt-16">
+                <div className="relative -mt-8 px-4 sm:-mt-10 sm:px-6 md:-mt-12 md:px-8 lg:-mt-10">
                     {/* Mobile Layout */}
                     <div className="block lg:hidden">
                         <div className="flex flex-col gap-4 sm:flex-row sm:items-end">
@@ -824,8 +954,8 @@ export default function CommunityDetailPage() {
                                         .toUpperCase()}
                                 </AvatarFallback>
                             </Avatar>
-                            <div className="pb-3">
-                                <div className="mb-2 flex items-center gap-3">
+                            <div className="pb-2">
+                                <div className="mb-1 flex items-center gap-3">
                                     <h1 className="text-foreground text-3xl font-bold xl:text-4xl">
                                         {community.name}
                                     </h1>
@@ -1630,16 +1760,293 @@ export default function CommunityDetailPage() {
                                         People who are part of this community
                                     </p>
                                 </div>
-                                {canInviteCommunityMembers && (
-                                    <Button
-                                        variant="outline"
-                                        onClick={() =>
-                                            setIsInviteEmailDialogOpen(true)
-                                        }
-                                    >
-                                        Invite Members
-                                    </Button>
-                                )}
+                                <div className="flex gap-2">
+                                    {canInviteCommunityMembers && (
+                                        <Button
+                                            variant="outline"
+                                            onClick={() =>
+                                                setIsInviteEmailDialogOpen(true)
+                                            }
+                                        >
+                                            Invite Members
+                                        </Button>
+                                    )}
+                                    {canManageCommunityMembers && (
+                                        <Dialog
+                                            open={isAddMembersDialogOpen}
+                                            onOpenChange={(open) => {
+                                                setIsAddMembersDialogOpen(open);
+                                                if (!open) {
+                                                    setMemberSearchTerm('');
+                                                    setSelectedUsersToAdd([]);
+                                                }
+                                            }}
+                                        >
+                                            <DialogTrigger asChild>
+                                                <Button variant="outline">
+                                                    <UserPlus className="mr-2 h-4 w-4" />
+                                                    Add Members
+                                                </Button>
+                                            </DialogTrigger>
+                                            <DialogContent>
+                                                <DialogHeader>
+                                                    <DialogTitle>
+                                                        Add Organization Members
+                                                    </DialogTitle>
+                                                    <DialogDescription>
+                                                        Add existing
+                                                        organization members to
+                                                        this community.
+                                                    </DialogDescription>
+                                                </DialogHeader>
+                                                <form
+                                                    onSubmit={handleAddMember}
+                                                    className="space-y-4"
+                                                >
+                                                    <div className="space-y-2">
+                                                        <Label htmlFor="member-search">
+                                                            Search Members
+                                                        </Label>
+                                                        <div className="relative">
+                                                            <Search className="text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
+                                                            <Input
+                                                                id="member-search"
+                                                                placeholder="Search by name or email..."
+                                                                value={
+                                                                    memberSearchTerm
+                                                                }
+                                                                onChange={(e) =>
+                                                                    setMemberSearchTerm(
+                                                                        e.target
+                                                                            .value,
+                                                                    )
+                                                                }
+                                                                className="pl-10"
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        <Label htmlFor="user-select">
+                                                            Select Members
+                                                        </Label>
+                                                        {availableOrgMembers &&
+                                                            availableOrgMembers.length >
+                                                                0 && (
+                                                                <div className="mb-2 flex gap-2">
+                                                                    <Button
+                                                                        type="button"
+                                                                        variant="outline"
+                                                                        size="sm"
+                                                                        onClick={() =>
+                                                                            setSelectedUsersToAdd(
+                                                                                availableOrgMembers.map(
+                                                                                    (
+                                                                                        m,
+                                                                                    ) =>
+                                                                                        m.id,
+                                                                                ),
+                                                                            )
+                                                                        }
+                                                                    >
+                                                                        Select
+                                                                        All
+                                                                    </Button>
+                                                                    <Button
+                                                                        type="button"
+                                                                        variant="outline"
+                                                                        size="sm"
+                                                                        onClick={() =>
+                                                                            setSelectedUsersToAdd(
+                                                                                [],
+                                                                            )
+                                                                        }
+                                                                    >
+                                                                        Clear
+                                                                        All
+                                                                    </Button>
+                                                                </div>
+                                                            )}
+                                                        <div className="max-h-60 space-y-2 overflow-y-auto rounded-md border p-3">
+                                                            {availableOrgMembers?.length ===
+                                                            0 ? (
+                                                                <div className="text-muted-foreground py-4 text-center">
+                                                                    {memberSearchTerm
+                                                                        ? `No members found matching "${memberSearchTerm}"`
+                                                                        : 'No available members to add'}
+                                                                </div>
+                                                            ) : (
+                                                                availableOrgMembers?.map(
+                                                                    (
+                                                                        member: (typeof availableOrgMembers)[number],
+                                                                    ) => (
+                                                                        <label
+                                                                            key={
+                                                                                member.id
+                                                                            }
+                                                                            className="hover:bg-muted/50 flex cursor-pointer items-center space-x-3 rounded-md p-2"
+                                                                        >
+                                                                            <Checkbox
+                                                                                checked={selectedUsersToAdd.includes(
+                                                                                    member.id,
+                                                                                )}
+                                                                                onCheckedChange={(
+                                                                                    checked,
+                                                                                ) => {
+                                                                                    if (
+                                                                                        checked
+                                                                                    ) {
+                                                                                        setSelectedUsersToAdd(
+                                                                                            (
+                                                                                                prev,
+                                                                                            ) => [
+                                                                                                ...prev,
+                                                                                                member.id,
+                                                                                            ],
+                                                                                        );
+                                                                                    } else {
+                                                                                        setSelectedUsersToAdd(
+                                                                                            (
+                                                                                                prev,
+                                                                                            ) =>
+                                                                                                prev.filter(
+                                                                                                    (
+                                                                                                        id,
+                                                                                                    ) =>
+                                                                                                        id !==
+                                                                                                        member.id,
+                                                                                                ),
+                                                                                        );
+                                                                                    }
+                                                                                }}
+                                                                            />
+                                                                            <div className="flex items-center gap-2">
+                                                                                <Avatar className="h-6 w-6">
+                                                                                    <AvatarImage
+                                                                                        src={
+                                                                                            member.image ||
+                                                                                            undefined
+                                                                                        }
+                                                                                        alt={
+                                                                                            member.name ||
+                                                                                            'User'
+                                                                                        }
+                                                                                    />
+                                                                                    <AvatarFallback>
+                                                                                        {member.name
+                                                                                            ? member.name
+                                                                                                  .substring(
+                                                                                                      0,
+                                                                                                      2,
+                                                                                                  )
+                                                                                                  .toUpperCase()
+                                                                                            : 'U'}
+                                                                                    </AvatarFallback>
+                                                                                </Avatar>
+                                                                                <span className="text-sm font-medium">
+                                                                                    {member.name ||
+                                                                                        'Unknown User'}
+                                                                                </span>
+                                                                                <span className="text-muted-foreground text-xs">
+                                                                                    (
+                                                                                    {member.email ||
+                                                                                        'No email'}
+
+                                                                                    )
+                                                                                </span>
+                                                                            </div>
+                                                                        </label>
+                                                                    ),
+                                                                )
+                                                            )}
+                                                        </div>
+                                                        {selectedUsersToAdd.length >
+                                                            0 && (
+                                                            <p className="text-muted-foreground text-sm">
+                                                                Selected{' '}
+                                                                {
+                                                                    selectedUsersToAdd.length
+                                                                }{' '}
+                                                                member(s)
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        <Label htmlFor="role-select">
+                                                            Role
+                                                        </Label>
+                                                        <Select
+                                                            value={
+                                                                selectedRoleToAdd
+                                                            }
+                                                            onValueChange={(
+                                                                value: string,
+                                                            ) =>
+                                                                setSelectedRoleToAdd(
+                                                                    value as
+                                                                        | 'member'
+                                                                        | 'moderator',
+                                                                )
+                                                            }
+                                                        >
+                                                            <SelectTrigger>
+                                                                <SelectValue />
+                                                            </SelectTrigger>
+                                                            <SelectContent>
+                                                                <SelectItem value="member">
+                                                                    Member
+                                                                </SelectItem>
+                                                                <SelectItem value="moderator">
+                                                                    Moderator
+                                                                </SelectItem>
+                                                            </SelectContent>
+                                                        </Select>
+                                                    </div>
+                                                    <DialogFooter>
+                                                        <Button
+                                                            type="button"
+                                                            variant="outline"
+                                                            onClick={() =>
+                                                                setIsAddMembersDialogOpen(
+                                                                    false,
+                                                                )
+                                                            }
+                                                            disabled={
+                                                                isAddingMembers
+                                                            }
+                                                        >
+                                                            Cancel
+                                                        </Button>
+                                                        <Button
+                                                            type="submit"
+                                                            disabled={
+                                                                isAddingMembers ||
+                                                                !selectedUsersToAdd.length ||
+                                                                availableOrgMembers?.length ===
+                                                                    0
+                                                            }
+                                                        >
+                                                            {isAddingMembers ? (
+                                                                <>
+                                                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                                                    Adding...
+                                                                </>
+                                                            ) : (
+                                                                <>
+                                                                    <UserPlus className="mr-2 h-4 w-4" />
+                                                                    Add{' '}
+                                                                    {selectedUsersToAdd.length >
+                                                                    1
+                                                                        ? `${selectedUsersToAdd.length} Members`
+                                                                        : 'Member'}
+                                                                </>
+                                                            )}
+                                                        </Button>
+                                                    </DialogFooter>
+                                                </form>
+                                            </DialogContent>
+                                        </Dialog>
+                                    )}
+                                </div>
                             </div>
 
                             {community.members &&
@@ -1840,17 +2247,32 @@ export default function CommunityDetailPage() {
                                                                         <DropdownMenuContent align="end">
                                                                             {member.role ===
                                                                                 'member' && (
-                                                                                <DropdownMenuItem
-                                                                                    onClick={() =>
-                                                                                        handleAssignModerator(
-                                                                                            member.userId,
-                                                                                        )
-                                                                                    }
-                                                                                >
-                                                                                    <Shield className="mr-2 h-4 w-4" />
-                                                                                    Make
-                                                                                    Moderator
-                                                                                </DropdownMenuItem>
+                                                                                <>
+                                                                                    <DropdownMenuItem
+                                                                                        onClick={() =>
+                                                                                            handleAssignModerator(
+                                                                                                member.userId,
+                                                                                            )
+                                                                                        }
+                                                                                    >
+                                                                                        <Shield className="mr-2 h-4 w-4" />
+                                                                                        Make
+                                                                                        Moderator
+                                                                                    </DropdownMenuItem>
+                                                                                    {canManageCommunityAdmins && (
+                                                                                        <DropdownMenuItem
+                                                                                            onClick={() =>
+                                                                                                handleAssignAdmin(
+                                                                                                    member.userId,
+                                                                                                )
+                                                                                            }
+                                                                                        >
+                                                                                            <Crown className="mr-2 h-4 w-4" />
+                                                                                            Make
+                                                                                            Admin
+                                                                                        </DropdownMenuItem>
+                                                                                    )}
+                                                                                </>
                                                                             )}
                                                                             {member.role ===
                                                                                 'moderator' && (
@@ -1866,6 +2288,21 @@ export default function CommunityDetailPage() {
                                                                                     Mod
                                                                                 </DropdownMenuItem>
                                                                             )}
+                                                                            {member.role ===
+                                                                                'admin' &&
+                                                                                canManageCommunityAdmins && (
+                                                                                    <DropdownMenuItem
+                                                                                        onClick={() =>
+                                                                                            handleRemoveAdmin(
+                                                                                                member.userId,
+                                                                                            )
+                                                                                        }
+                                                                                    >
+                                                                                        <UserMinus className="mr-2 h-4 w-4" />
+                                                                                        Remove
+                                                                                        Admin
+                                                                                    </DropdownMenuItem>
+                                                                                )}
                                                                             <DropdownMenuSeparator />
                                                                             <DropdownMenuItem
                                                                                 onClick={() =>
@@ -2081,7 +2518,7 @@ export default function CommunityDetailPage() {
                             onOpenChange={setIsInviteEmailDialogOpen}
                             communityId={community.id}
                             communityName={community.name}
-                            isAdmin={isAdmin}
+                            isAdmin={canManageCommunityAdmins}
                         />
                     </TabsContent>
 
